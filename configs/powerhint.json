@@ -82,7 +82,7 @@
       "Path": "/dev/cpuctl/top-app/cpu.uclamp.min",
       "Values": [
         "50",
-        "30",
+        "15",
         "0"
       ],
       "DefaultIndex": 2,
@@ -102,7 +102,7 @@
       "Path": "/dev/cpuctl/foreground/cpu.uclamp.min",
       "Values": [
         "50",
-        "30",
+        "15",
         "0"
       ],
       "DefaultIndex": 2,
@@ -297,13 +297,13 @@
       "PowerHint": "INTERACTION",
       "Node": "UclampTAMin",
       "Duration": 0,
-      "Value": "30"
+      "Value": "15"
     },
     {
       "PowerHint": "INTERACTION",
       "Node": "UclampFGMin",
       "Duration": 0,
-      "Value": "30"
+      "Value": "15"
     },
     {
       "PowerHint": "INTERACTION",
@@ -327,7 +327,7 @@
       "PowerHint": "INTERACTION",
       "Node": "SchedBusyHystEnableCPUs",
       "Duration": 0,
-      "Value": "255"
+      "Value": "63"
     },
     {
       "PowerHint": "INTERACTION",
@@ -547,25 +547,25 @@
     {
       "PowerHint": "DISPLAY_UPDATE_IMMINENT",
       "Node": "UclampTAMin",
-      "Duration": 120,
-      "Value": "30"
+      "Duration": 60,
+      "Value": "15"
     },
     {
       "PowerHint": "DISPLAY_UPDATE_IMMINENT",
       "Node": "UclampFGMin",
-      "Duration": 120,
-      "Value": "30"
+      "Duration": 60,
+      "Value": "15"
     },
     {
       "PowerHint": "DISPLAY_UPDATE_IMMINENT",
       "Node": "UclampTALatency",
-      "Duration": 120,
+      "Duration": 60,
       "Value": "1"
     },
     {
       "PowerHint": "DISPLAY_UPDATE_IMMINENT",
       "Node": "UclampFGLatency",
-      "Duration": 120,
+      "Duration": 60,
       "Value": "1"
     },
     {
