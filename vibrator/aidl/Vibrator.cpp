@@ -256,6 +256,16 @@ public:
         return mVibratorOL.getSupportedBraking(supported);
     }
 
+    /*
+     * f0 lives on the OL (FF) path only: it is derived from a compile-time LRA
+     * period constant (VibratorOL::LRA_PERIOD_US), not from the driver.
+     * VibratorCL::getResonantFrequency() returns EX_UNSUPPORTED_OPERATION, so
+     * never route this through mSelectedVibrator.
+     */
+    ndk::ScopedAStatus getResonantFrequency(float* resonantFreqHz) {
+        return mVibratorOL.getResonantFrequency(resonantFreqHz);
+    }
+
     ndk::ScopedAStatus composePwle(const std::vector<PrimitivePwle>& composite,
                     const std::shared_ptr<IVibratorCallback>& callback) {
         return mVibratorOL.composePwle(composite, callback);
@@ -338,8 +348,8 @@ ndk::ScopedAStatus Vibrator::alwaysOnDisable(int32_t id __unused) {
     return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
 }
 
-ndk::ScopedAStatus Vibrator::getResonantFrequency(float* resonantFreqHz __unused) {
-    return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+ndk::ScopedAStatus Vibrator::getResonantFrequency(float* resonantFreqHz) {
+    return pImpl->getResonantFrequency(resonantFreqHz);
 }
 
 ndk::ScopedAStatus Vibrator::getQFactor(float* qFactor __unused) {
