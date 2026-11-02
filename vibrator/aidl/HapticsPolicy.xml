@@ -37,20 +37,35 @@
 
 <hapticsPolicyConfiguration>
     <!--If timeout <= maxMs, then OL else CL -->
+    <!-- VibratorCL has no waveform data on this device (no /vendor/etc/effect*.raw)
+         and its on() path cannot drive the motor, so anything routed there is
+         silently dropped. Keep every sustained vibration on the openloop backend;
+         VibratorOL::on() maps it to FF_CONSTANT, which the driver bounds by
+         replay.length and therefore has no duration ceiling of its own. -->
     <hapticsONAPI>
-        <maxMs>3000</maxMs>
+        <maxMs>2147483647</maxMs>
     </hapticsONAPI>
     <!--Following effects are supported by OL, remaining by CL-->
     <hapticsPerformAPI>
-    <!-- 0 - CLICK, 1 - DOUBLE_CLICK, 2 - TICK, 3 - THUD, 4 - POP, 5 - HEAVY_CLICK-->
-        <effect_id>0,1,2,3,4,5</effect_id>
+    <!-- 0 - CLICK, 1 - DOUBLE_CLICK, 2 - TICK, 3 - THUD, 4 - POP, 5 - HEAVY_CLICK
+         6..16 - RINGTONE_1..RINGTONE_11, 17..20 - RINGTONE_12..15,
+         21 - TEXTURE_TICK
+         These are the complete AOSP Effect enum values (Effect.aidl, 0..21).
+         The CL backend has no waveform data (no /vendor/etc/effect*.raw shipped by
+         this device) and rejects anything above HEAVY_CLICK, so every effect must
+         route to the openloop (kernel FF) backend, which is fed by the stock
+         vibrator_effect.json + 9999/def/*.bin set. -->
+        <effect_id>0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21</effect_id>
     </hapticsPerformAPI>
     <!--If support == True, then OL else CL-->
     <hapticsComposeAPI>
         <SupportCompose>True</SupportCompose>
     </hapticsComposeAPI>
     <!--If support == True, then OL else CL-->
+    <!-- VibratorCL::composePwle() is a stub returning EX_UNSUPPORTED_OPERATION;
+         VibratorOL implements it by synthesising an 8 kHz amplitude envelope and
+         pushing it through FF_CUSTOM. Route PWLE to OL for that to take effect. -->
     <hapticsComposePwleAPI>
-        <SupportComposePWLE>False</SupportComposePWLE>
+        <SupportComposePWLE>True</SupportComposePWLE>
     </hapticsComposePwleAPI>
 </hapticsPolicyConfiguration>
