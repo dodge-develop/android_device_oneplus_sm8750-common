@@ -32,6 +32,7 @@
 #include <inttypes.h>
 #include <linux/input.h>
 #include <log/log.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <bits/epoll_event.h>
@@ -51,8 +52,21 @@ namespace android {
 namespace hardware {
 namespace vibrator {
 
+/*
+ * Amplitude ladder. Pixel's cs40l26 HAL drives STRONG/MEDIUM/LIGHT at
+ * 1.0 / 0.7 / 0.5 of full scale; mirror those ratios here.
+ *
+ * These are raw ff_effect magnitudes in the 0..0x7fff domain, and the PMIH010x
+ * driver scales them linearly:
+ *   play->vmax_mv = (magnitude * effect->vmax_mv) / 0x7fff
+ * (qcom-hv-haptics.c, haptics_load_periodic_effect). So the ratio to 0x7fff is
+ * exactly the fraction of the configured drive voltage.
+ *   STRONG = 0x7fff -> 1.000
+ *   MEDIUM = 0x5999 -> 0.700  (was 0x5fff, i.e. 0.750, before this change)
+ *   LIGHT  = 0x3fff -> 0.500
+ */
 #define STRONG_MAGNITUDE        0x7fff
-#define MEDIUM_MAGNITUDE        0x5fff
+#define MEDIUM_MAGNITUDE        0x5999
 #define LIGHT_MAGNITUDE         0x3fff
 #define INVALID_VALUE           -1
 #define CUSTOM_DATA_LEN         3
@@ -272,10 +286,20 @@ errout:
 }
 
 int InputFFDevice::on(int32_t timeoutMs) {
-    // Short vibration: bin 2 (CLICK, 16ms crisp tap, peak ±126)
-    // Long vibration: bin 369 (300ms, smooth 16Hz wave, CV 0.098, zero silence)
-    int effectId = (timeoutMs < 50) ? 2 : 369;
-    return play(effectId, timeoutMs, NULL);
+    /*
+     * Sustained vibration ("vibrate for N ms"), used by apps such as Douyin and
+     * WeChat and by charging/notification feedback.
+     *
+     * Goes through the FF_CONSTANT branch of play(): a constant drive level held
+     * for replay.length, which the driver schedules via stop_work. This matches
+     * the upstream QTI HAL exactly and has no length ceiling - the FIFO sample
+     * budget only applies to FF_PERIODIC (FF_CUSTOM) waveforms.
+     *
+     * Do not substitute a bin here: a bin is a fixed-length waveform and would
+     * have to be looped to cover an arbitrary timeout, producing an audible
+     * periodic ripple instead of a steady buzz.
+     */
+    return play(INVALID_VALUE, timeoutMs, NULL);
 }
 
 int InputFFDevice::off() {
@@ -527,6 +551,25 @@ static bool is_VI_sense_supported() {
     return atoi(visense);
 }
 
+/*
+ * LRA resonant period, in microseconds, of the actuator fitted to dodge.
+ *
+ * Source: the DT property qcom,lra-period-us is overridden to <7692> for this
+ * board by oplus/oplus_misc/oplus-misc-23821.dtsi, which the dodge overlay
+ * (dodge-23821-sun-overlay.dts) includes on top of the pmih010x.dtsi default of
+ * <6667>. The driver stores it verbatim into chip->config.t_lra_us and never
+ * writes it back, so 7692 is effectively a build-time constant here.
+ *
+ * Deliberately NOT read from /sys/class/qcom-haptics/t_lra_us at runtime:
+ * that node carries the generic sysfs label, and hal_vibrator_default is only
+ * granted write (not read) access to vendor_sysfs_haptics, so a runtime read
+ * always fails EACCES under SELinux. See AUDIT_A.md.
+ *
+ * Note lra_frequency_hz (the closed-loop value) reads 0 on dodge because no
+ * calibration has run, so it cannot be used as a source either.
+ */
+static constexpr uint32_t LRA_PERIOD_US = 7692;
+
 VibratorOL::VibratorOL() {
     struct epoll_event ev;
 
@@ -582,6 +625,16 @@ VibratorOL::~VibratorOL() {
 
 ndk::ScopedAStatus VibratorOL::getCapabilities(int32_t* _aidl_return) {
     *_aidl_return = IVibrator::CAP_ON_CALLBACK;
+
+    /*
+     * Advertised before the ledVib early-return below, because the value does
+     * not depend on which playback backend is selected: getResonantFrequency()
+     * reports a compile-time constant (LRA_PERIOD_US) and cannot fail, so every
+     * backend can honour it. VibratorService only queries f0 when this bit is
+     * set; IVibrator.aidl documents the flag as "Support is reflected in
+     * getCapabilities (CAP_GET_RESONANT_FREQUENCY)".
+     */
+    *_aidl_return |= IVibrator::CAP_GET_RESONANT_FREQUENCY;
 
     if (ledVib.mDetected) {
         *_aidl_return |= IVibrator::CAP_PERFORM_CALLBACK;
@@ -663,29 +716,98 @@ ndk::ScopedAStatus VibratorOL::perform(Effect effect, EffectStrength es, const s
 
     ALOGD("Vibrator perform effect %d", effect);
 
-    if (Offload.mEnabled == 1) {
-         if ((effect < Effect::CLICK) ||
-             ((effect > Effect::HEAVY_CLICK) && (effect < Effect::RINGTONE_12)) ||
-             (effect > Effect::RINGTONE_15))
-             return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
-    } else {
-         if (effect < Effect::CLICK || effect > Effect::HEAVY_CLICK)
-             return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
-    }
-
     if (es != EffectStrength::LIGHT && es != EffectStrength::MEDIUM && es != EffectStrength::STRONG)
         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
 
-    // Map AOSP Effect IDs to ColorOS bin IDs (based on official scene mapping)
+    /*
+     * Map AOSP Effect to a ColorOS waveform id.
+     *
+     * The id passed down is a *waveform id*: the key space used both by
+     * /odm/etc/vibrator/9999/def/effect_<id>.bin and by vibrator_effect.json.
+     * With USE_EFFECT_STREAM enabled, get_effect_stream(id) resolves it to the
+     * raw FIFO sample data from that json, so any id present in def_style plays
+     * directly and never touches the kernel DT effect table.
+     *
+     * Every id below is cross-checked against the official scene table
+     * (my_product/etc/vibrator/effect_waveform.xml, 442 entries) where
+     * "effect_id" is the logical scene and "waveform_id" is the bin index.
+     * Only waveform_id values that actually ship as a .bin are used.
+     */
     int effectId;
     switch (effect) {
-        case Effect::CLICK:        effectId = 2;   break;  // heavy: back gesture, phone-defining haptic
-        case Effect::DOUBLE_CLICK: effectId = 315; break;  // screenlock: two strong pulses
-        case Effect::TICK:         effectId = 111; break;  // heavy: Gboard typing feedback
-        case Effect::THUD:         effectId = 1;   break;  // heavy: lockscreen password, calculator
-        case Effect::POP:          effectId = 7;   break;  // light: recent task card switch
-        case Effect::HEAVY_CLICK:  effectId = 6;   break;  // heavy: long press power button
-        default:                   effectId = static_cast<int>(effect); break;
+        /*
+         * wav=2 -> effect_moderate_short_vibrate_once (RAM, TOUCH, 110ms).
+         * Kept over wav=10 pressure_key_click_effect: that bin is 13650 B and
+         * its official duration is 37ms, so it is a pressure-shell artifact
+         * rather than a core UI click, and at 24 kHz it would play 569ms.
+         * wav=2 is the shortest "moderate" entry in the official short-vibrate
+         * ladder (weakest=wav1, weak=wav2... ) and is already field-proven.
+         */
+        case Effect::CLICK:        effectId = 2;   break;
+        /* wav=315 -> effect_lockacreen_feedback (RTP, TOUCH, 115ms). */
+        case Effect::DOUBLE_CLICK: effectId = 315; break;
+        /* wav=111 -> effect_other_keyboard_medium (RTP, TOUCH, 36ms). */
+        case Effect::TICK:         effectId = 111; break;
+        /* wav=1 -> effect_weak_short_vibrate_once (RAM, TOUCH, 35ms). */
+        case Effect::THUD:         effectId = 1;   break;
+        /* wav=7 -> effect_customized_weak_granular (RAM, TOUCH, 30ms). */
+        case Effect::POP:          effectId = 7;   break;
+        /* wav=6 -> effect_customized_strong_granular (RAM, TOUCH, 45ms). */
+        case Effect::HEAVY_CLICK:  effectId = 6;   break;
+        /*
+         * wav=105 -> effect_other_stepable_regulate (RTP, TOUCH, 66ms).
+         * Official slider-step feedback, 126 B / 5.2ms of waveform: exactly the
+         * granularity a texture tick wants.
+         */
+        case Effect::TEXTURE_TICK: effectId = 105; break;
+
+        /*
+         * RINGTONE_1..RINGTONE_11 -> two official series, interleaved.
+         *
+         * Only five RINGTONE-usage bins ship (wav 41..45). They have exact
+         * NOTIFICATION brothers with the same name suffix (wav 366..370,
+         * effect_message_*). Both series are the same five motifs at
+         * different lengths, so RINGTONE_1..10 walks short/long per motif and
+         * RINGTONE_11 reuses the longest one:
+         *
+         *   RINGTONE_1  wav367 message_streak      390ms
+         *   RINGTONE_2  wav42  notification_streak 2081ms
+         *   RINGTONE_3  wav369 message_remind      330ms
+         *   RINGTONE_4  wav44  notification_remind 6000ms
+         *   RINGTONE_5  wav368 message_heartbeat   470ms
+         *   RINGTONE_6  wav43  notification_heartbeat 3968ms
+         *   RINGTONE_7  wav366 message_symphonic   580ms
+         *   RINGTONE_8  wav41  notification_symphonic 2729ms
+         *   RINGTONE_9  wav370 message_rapid       430ms
+         *   RINGTONE_10 wav45  notification_rapid  4516ms
+         *   RINGTONE_11 wav43  notification_heartbeat 3968ms (longest motif)
+         */
+        case Effect::RINGTONE_1:   effectId = 367; break;
+        case Effect::RINGTONE_2:   effectId = 42;  break;
+        case Effect::RINGTONE_3:   effectId = 369; break;
+        case Effect::RINGTONE_4:   effectId = 44;  break;
+        case Effect::RINGTONE_5:   effectId = 368; break;
+        case Effect::RINGTONE_6:   effectId = 43;  break;
+        case Effect::RINGTONE_7:   effectId = 366; break;
+        case Effect::RINGTONE_8:   effectId = 41;  break;
+        case Effect::RINGTONE_9:   effectId = 370; break;
+        case Effect::RINGTONE_10:  effectId = 45;  break;
+        case Effect::RINGTONE_11:  effectId = 43;  break;
+
+        /* Pre-existing offload-only mappings, unchanged. */
+        case Effect::RINGTONE_12:  effectId = 41;  break;
+        case Effect::RINGTONE_13:  effectId = 42;  break;
+        case Effect::RINGTONE_14:  effectId = 43;  break;
+        case Effect::RINGTONE_15:  effectId = 45;  break;
+
+        /*
+         * No waveform id exists for any other Effect. Reject instead of
+         * forwarding the raw enum value downstream: an unmapped number would
+         * otherwise be interpreted as a waveform id.
+         */
+        default:
+            ALOGE("Vibrator perform: unsupported effect %d", static_cast<int>(effect));
+            return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
     }
 
     ret = ff.playEffect(effectId, es, &playLengthMs);
@@ -709,13 +831,27 @@ ndk::ScopedAStatus VibratorOL::getSupportedEffects(std::vector<Effect>* _aidl_re
     if (ledVib.mDetected)
         return ndk::ScopedAStatus::ok();
 
-    if (Offload.mEnabled == 1)
-        *_aidl_return = {Effect::CLICK, Effect::DOUBLE_CLICK, Effect::TICK, Effect::THUD,
-                         Effect::POP, Effect::HEAVY_CLICK, Effect::RINGTONE_12,
-                         Effect::RINGTONE_13, Effect::RINGTONE_14, Effect::RINGTONE_15};
-    else
-        *_aidl_return = {Effect::CLICK, Effect::DOUBLE_CLICK, Effect::TICK, Effect::THUD,
-                         Effect::POP, Effect::HEAVY_CLICK};
+    /*
+     * Keep this list in sync with the switch in perform(): only report an
+     * effect there when it has a real waveform id from the official scene
+     * table, otherwise VibratorService will forward requests that we then
+     * have to reject.
+     *
+     * The offload branch only adds the four RINGTONE slots that the AON offload
+     * path was written for; on dodge ro.vendor.qc_aon_presence is unset, so
+     * Offload.mEnabled is always 0 and that branch stays dormant.
+     */
+    *_aidl_return = {Effect::CLICK, Effect::DOUBLE_CLICK, Effect::TICK, Effect::THUD,
+                     Effect::POP, Effect::HEAVY_CLICK, Effect::TEXTURE_TICK,
+                     Effect::RINGTONE_1, Effect::RINGTONE_2, Effect::RINGTONE_3,
+                     Effect::RINGTONE_4, Effect::RINGTONE_5, Effect::RINGTONE_6,
+                     Effect::RINGTONE_7, Effect::RINGTONE_8, Effect::RINGTONE_9,
+                     Effect::RINGTONE_10, Effect::RINGTONE_11};
+
+    if (Offload.mEnabled == 1) {
+        _aidl_return->insert(_aidl_return->end(), {Effect::RINGTONE_12, Effect::RINGTONE_13,
+                                                   Effect::RINGTONE_14, Effect::RINGTONE_15});
+    }
 
     return ndk::ScopedAStatus::ok();
 }
@@ -1029,8 +1165,19 @@ ndk::ScopedAStatus VibratorOL::alwaysOnDisable(int32_t id __unused) {
     return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
 }
 
-ndk::ScopedAStatus VibratorOL::getResonantFrequency(float *resonantFreqHz __unused) {
-    return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+ndk::ScopedAStatus VibratorOL::getResonantFrequency(float *resonantFreqHz) {
+    /*
+     * f0 = 1e6 / LRA_PERIOD_US = 1e6 / 7692 = 130.0052 Hz.
+     *
+     * Not gated on ff.isPresent(): unlike composePwle() the value does not come
+     * from the FF device, so a non-functional input node should not stop us
+     * from reporting the actuator resonance the DT describes.
+     */
+    *resonantFreqHz = 1000000.0f / (float)LRA_PERIOD_US;
+    ALOGD("Vibrator resonant frequency: %f Hz (lra period %u us)",
+          *resonantFreqHz, LRA_PERIOD_US);
+
+    return ndk::ScopedAStatus::ok();
 }
 
 ndk::ScopedAStatus VibratorOL::getQFactor(float *qFactor __unused) {
